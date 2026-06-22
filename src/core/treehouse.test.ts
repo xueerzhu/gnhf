@@ -65,7 +65,7 @@ describe("treehouseGet", () => {
   it("parses the lease JSON line and forwards --wait", () => {
     mockExecFileSync.mockReturnValue(
       'treehouse: launching editor\n' +
-        '{"leased":true,"slot":2,"path":"/clone","port":8083,"token":"tok","ref":"main"}\n' as unknown as Buffer,
+        '{"leased":true,"slot":2,"path":"/clone","port":8083,"token":"tok","ref":"main"}\n',
     );
 
     const lease = treehouseGet("/repo/scripts/treehouse.sh", "/repo", {
@@ -94,7 +94,7 @@ describe("treehouseGet", () => {
 
   it("omits --wait when not requested", () => {
     mockExecFileSync.mockReturnValue(
-      '{"leased":true,"slot":1,"path":"/c","port":8082,"token":"t"}' as unknown as Buffer,
+      '{"leased":true,"slot":1,"path":"/c","port":8082,"token":"t"}',
     );
     treehouseGet("/s", "/repo", { branch: "dev", label: "l", wait: false });
     expect(argsOf(mockExecFileSync.mock.calls[0])).not.toContain("--wait");
@@ -102,7 +102,7 @@ describe("treehouseGet", () => {
 
   it("throws (surfacing the reason) when the pool did not lease", () => {
     mockExecFileSync.mockReturnValue(
-      '{"leased":false,"reason":"max-wait exceeded"}' as unknown as Buffer,
+      '{"leased":false,"reason":"max-wait exceeded"}',
     );
     expect(() =>
       treehouseGet("/s", "/repo", { branch: "main", label: "l", wait: false }),

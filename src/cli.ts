@@ -771,28 +771,46 @@ program
         treehouseLease = lease;
         effectiveCwd = lease.path;
 
-        // The leased clone is synced to the base branch; carve the gnhf branch
-        // inside it. Collision-safe because a prior lease on this slot may have
-        // left the ref behind (return resets the working tree, not refs).
-        const createdBranch = createBranchWithSuffix(
-          slugifyPrompt(prompt),
-          effectiveCwd,
-        );
-        const createdRunId = createdBranch.split("/")[1]!;
-        const baseCommit = getHeadCommit(effectiveCwd);
-        runInfo = setupRun(
-          createdRunId,
-          prompt,
-          baseCommit,
-          effectiveCwd,
-          schemaOptions,
-        );
+        try {
+          // The leased clone is synced to the base branch; carve the gnhf
+          // branch inside it. Collision-safe because a prior lease on this slot
+          // may have left the ref behind (return resets the working tree, not
+          // refs).
+          const createdBranch = createBranchWithSuffix(
+            slugifyPrompt(prompt),
+            effectiveCwd,
+          );
+          const createdRunId = createdBranch.split("/")[1]!;
+          const baseCommit = getHeadCommit(effectiveCwd);
+          runInfo = setupRun(
+            createdRunId,
+            prompt,
+            baseCommit,
+            effectiveCwd,
+            schemaOptions,
+          );
 
-        treehouseHeartbeatTimer = startTreehouseHeartbeat(
-          treehouseScript,
-          treehouseRepoRoot,
-          lease.token,
-        );
+          treehouseHeartbeatTimer = startTreehouseHeartbeat(
+            treehouseScript,
+            treehouseRepoRoot,
+            lease.token,
+          );
+        } catch (error) {
+          // Setup threw before the run-wide exit-net was armed. No commits
+          // exist yet, so release the slot immediately instead of leaking the
+          // lease until its TTL, then resurface the original error.
+          if (treehouseHeartbeatTimer) {
+            clearInterval(treehouseHeartbeatTimer);
+            treehouseHeartbeatTimer = null;
+          }
+          treehouseReturned = true;
+          try {
+            treehouseReturn(treehouseScript!, treehouseRepoRoot!, lease.token);
+          } catch {
+            // Best-effort release; the setup error below is the actionable one.
+          }
+          throw error;
+        }
 
         console.error(
           `\n  gnhf: leased slot ${lease.slot} at ${lease.path} ` +
@@ -1016,12 +1034,12 @@ program
             console.error(
               `\n  gnhf: could not land "${branchName}" in the main repo ` +
                 `(${error instanceof Error ? error.message : String(error)}).` +
-                `\n  gnhf: holding the lease so your work is NOT lost — it is committed in the clone at:` +
+                `\n  gnhf: holding the lease so your work is NOT lost - it is committed in the clone at:` +
                 `\n        ${treehouseLease.path}` +
                 `\n  gnhf: recover it, then release the slot with: ` +
                 `${treehouseScript} return ${treehouseLease.token}\n`,
             );
-            return; // do NOT return the lease — returning resets the clone
+            return; // do NOT return the lease - returning resets the clone
           }
         }
 
@@ -1029,7 +1047,7 @@ program
         treehouseReturn(treehouseScript, treehouseRepoRoot, treehouseLease.token);
         if (commitCount > 0) {
           console.error(
-            `\n  gnhf: landed "${branchName}" in the main repo — review and merge it there. ` +
+            `\n  gnhf: landed "${branchName}" in the main repo - review and merge it there. ` +
               `Released treehouse slot ${treehouseLease.slot}.\n`,
           );
         } else {
