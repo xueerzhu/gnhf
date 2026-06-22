@@ -188,6 +188,29 @@ Pass `--worktree` to run each agent in an isolated [git worktree](https://git-sc
 - Worktrees with **no commits** are automatically removed on exit unless a pending commit failure left uncommitted work to inspect or repair.
 - `--worktree` must be run from a non-gnhf branch (typically `main`).
 
+### Treehouse Mode
+
+Pass `--treehouse` to run inside a leased **pool clone** instead of a git worktree. A worktree shares the main repo's object store and is invisible to a running Unity Editor (commits in `<repo>-gnhf-worktrees/*` never appear in the editor's checkout); a pool clone is a full, independent project an Editor can open and compile. This mode targets engines like Unity where isolation has to be a real checkout, not a worktree.
+
+`--treehouse` shells out to a pool-control script that exposes three subcommands and a JSON contract:
+
+- `get --branch <ref> --label <l> [--wait]` → prints `{"leased":true,"slot":N,"path":"…","port":P,"token":"…","ref":"…"}`
+- `heartbeat <token>` → keeps a long lease alive (gnhf heartbeats every 10 min; the lease TTL must be longer)
+- `return <token>` → releases the clone (and is expected to reset it to base)
+
+[Tower Lab](https://github.com/) ships the reference implementation at `scripts/treehouse.sh`. gnhf resolves the script from `<repoRoot>/scripts/treehouse.sh` by default; set `GNHF_TREEHOUSE_SCRIPT` to point elsewhere.
+
+Lifecycle of a `--treehouse` run:
+
+1. gnhf leases a clone for the current branch (waiting in the pool's queue if every slot is busy), creates the `gnhf/<slug>` branch **inside the clone**, and runs the agent there.
+2. A background heartbeat keeps the lease from expiring during long runs.
+3. On exit, if the run produced commits, gnhf **fetches the `gnhf/<slug>` branch back into the main repo** (updating only that ref — your working tree and current branch are untouched) and then returns the lease. You review and merge the branch in the main repo, exactly as you would a preserved worktree.
+4. If the fetch-back fails, gnhf **holds the lease** and prints where the commits live plus the `return` command, rather than resetting the clone and losing work.
+
+- `--treehouse` must be run from a non-gnhf branch, and cannot be combined with `--worktree` or `--current-branch`.
+- Resume of an interrupted treehouse run is not automatic: the clone is reset on return, so re-run from the landed `gnhf/<slug>` branch in the main repo (it behaves like any other gnhf branch).
+- **Editor working-tree churn is the pool script's responsibility.** gnhf commits with `git add -A`, so if the leased editor rewrites or deletes tracked files on open (e.g. Unity regenerating asset metadata), that churn lands in the agent's commit. The pool-control script should keep its own volatile paths out of the way — the Tower Lab reference marks them `git update-index --skip-worktree` for the lease — so each commit reflects only the agent's work.
+
 ## CLI Reference
 
 | Command                   | Description                                     |
@@ -209,6 +232,7 @@ If you run `gnhf` on an existing `gnhf/` branch with a different prompt, gnhf as
 | `--stop-when <cond>`     | End when the agent reports this condition, after any commit-failure repair; persists across resume     | unlimited              |
 | `--prevent-sleep <mode>` | Prevent system sleep during the run (`on`/`off` or `true`/`false`)                                     | config file (`on`)     |
 | `--worktree`             | Run in a separate git worktree (enables multiple agents concurrently)                                  | `false`                |
+| `--treehouse`            | Run in a leased pool clone (real isolated checkout, e.g. for Unity) instead of a worktree; lands the branch back in the main repo | `false`                |
 | `--current-branch`       | Run on the current branch instead of creating a `gnhf/` branch                                         | `false`                |
 | `--push`                 | Push the current branch after each successful iteration                                                | `false`                |
 | `--meteor-frequency <n>` | Set TUI meteor frequency from 0 to 5 (`0` disables meteors)                                            | `3`                    |

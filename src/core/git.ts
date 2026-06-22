@@ -299,6 +299,24 @@ export function getRepoRootDir(cwd: string): string {
   return git(["rev-parse", "--show-toplevel"], cwd);
 }
 
+// Land a branch from a sibling checkout (e.g. a treehouse pool clone) into this
+// repo by fetching it into a local ref. This updates only the named ref — it
+// never touches the working tree or the checked-out branch — so it is safe to
+// run against the main checkout while it sits on another branch. Used by
+// --treehouse to preserve a run's commits before the disposable clone is reset.
+// Git refuses to update the ref if it is the destination's current branch,
+// which is the correct safe failure (the caller holds the lease and surfaces it).
+export function fetchBranchFromPath(
+  destRepoCwd: string,
+  sourcePath: string,
+  branchName: string,
+): void {
+  git(
+    ["fetch", sourcePath, `+${branchName}:refs/heads/${branchName}`],
+    destRepoCwd,
+  );
+}
+
 export function createWorktree(
   baseCwd: string,
   worktreePath: string,
