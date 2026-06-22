@@ -37,9 +37,18 @@ import {
   createWorktree,
   removeWorktree,
   listWorktreePaths,
+  getBranchCommitCount,
   getBranchDiffStats,
+  fetchBranchFromPath,
   type BranchDiffStats,
 } from "./core/git.js";
+import {
+  resolveTreehouseScript,
+  treehouseGet,
+  startTreehouseHeartbeat,
+  treehouseReturn,
+  type TreehouseLease,
+} from "./core/treehouse.js";
 import {
   type RunInfo,
   type RunSchemaOptions,
@@ -590,6 +599,11 @@ program
     false,
   )
   .option(
+    "--treehouse",
+    "Run in a leased treehouse pool clone (a real isolated checkout on its own Unity QA port) instead of a git worktree; lands the gnhf branch back in the main repo on exit. Requires a pool-control script (see GNHF_TREEHOUSE_SCRIPT)",
+    false,
+  )
+  .option(
     "--push",
     "Push the current branch after each successful iteration",
     false,
@@ -612,6 +626,7 @@ program
         preventSleep?: boolean;
         worktree: boolean;
         currentBranch: boolean;
+        treehouse: boolean;
         push: boolean;
         meteorFrequency: number;
         mock: boolean;
@@ -695,12 +710,25 @@ program
       let effectiveCwd = cwd;
       let worktreePath: string | null = null;
       let worktreeCleanup: (() => void) | null = null;
+      let treehouseLease: TreehouseLease | null = null;
+      let treehouseScript: string | null = null;
+      let treehouseRepoRoot: string | null = null;
+      let treehouseHeartbeatTimer: NodeJS.Timeout | null = null;
+      let treehouseReturned = false;
+      let treehouseFinalizeRan = false;
 
       const currentBranch = getCurrentBranch(cwd);
       const onGnhfBranch = currentBranch.startsWith("gnhf/");
 
-      if (options.currentBranch && options.worktree) {
-        console.error("Cannot combine --current-branch and --worktree.");
+      const exclusiveModeCount = [
+        options.worktree,
+        options.currentBranch,
+        options.treehouse,
+      ].filter(Boolean).length;
+      if (exclusiveModeCount > 1) {
+        console.error(
+          "Choose at most one of --worktree, --current-branch, and --treehouse.",
+        );
         process.exit(1);
       }
 
@@ -716,7 +744,61 @@ program
       let runInfo;
       let startIteration = 0;
 
-      if (options.worktree) {
+      if (options.treehouse) {
+        if (!prompt) {
+          program.help();
+          return;
+        }
+
+        if (onGnhfBranch) {
+          console.error(
+            "Cannot use --treehouse from a gnhf branch. Switch to the base branch first.",
+          );
+          process.exit(1);
+        }
+
+        treehouseRepoRoot = getRepoRootDir(cwd);
+        treehouseScript = resolveTreehouseScript(treehouseRepoRoot);
+        console.error(
+          `\n  gnhf: leasing a treehouse clone on "${currentBranch}" ` +
+            `(a cold Unity Editor start can take 1-2 min)...\n`,
+        );
+        const lease = treehouseGet(treehouseScript, treehouseRepoRoot, {
+          branch: currentBranch,
+          label: `gnhf:${promptRunId(prompt)}`,
+          wait: true,
+        });
+        treehouseLease = lease;
+        effectiveCwd = lease.path;
+
+        // The leased clone is synced to the base branch; carve the gnhf branch
+        // inside it. Collision-safe because a prior lease on this slot may have
+        // left the ref behind (return resets the working tree, not refs).
+        const createdBranch = createBranchWithSuffix(
+          slugifyPrompt(prompt),
+          effectiveCwd,
+        );
+        const createdRunId = createdBranch.split("/")[1]!;
+        const baseCommit = getHeadCommit(effectiveCwd);
+        runInfo = setupRun(
+          createdRunId,
+          prompt,
+          baseCommit,
+          effectiveCwd,
+          schemaOptions,
+        );
+
+        treehouseHeartbeatTimer = startTreehouseHeartbeat(
+          treehouseScript,
+          treehouseRepoRoot,
+          lease.token,
+        );
+
+        console.error(
+          `\n  gnhf: leased slot ${lease.slot} at ${lease.path} ` +
+            `(Unity QA on :${lease.port})\n`,
+        );
+      } else if (options.worktree) {
         if (!prompt) {
           program.help();
           return;
@@ -883,6 +965,88 @@ program
         runInfo = initializeNewBranch(prompt, cwd, schemaOptions);
       }
 
+      // Land a --treehouse run's commits in the main repo, then release the
+      // clone. Order is load-bearing: `treehouse return` resets the clone, which
+      // would destroy the gnhf branch, so we fetch it into the main repo FIRST
+      // and only return once the work is safely landed. If the fetch fails we
+      // hold the lease and tell the user where their commits live, rather than
+      // resetting the clone and losing them. Idempotent and synchronous so it
+      // can double as a process "exit" safety net on a hard crash.
+      const finalizeTreehouse = (): void => {
+        treehouseFinalizeRan = true;
+        if (treehouseHeartbeatTimer) {
+          clearInterval(treehouseHeartbeatTimer);
+          treehouseHeartbeatTimer = null;
+        }
+        if (
+          !treehouseLease ||
+          !treehouseScript ||
+          !treehouseRepoRoot ||
+          treehouseReturned
+        ) {
+          return;
+        }
+
+        let branchName = "HEAD";
+        let commitCount = 0;
+        try {
+          branchName = getCurrentBranch(effectiveCwd);
+        } catch {
+          // Fall back to HEAD; nothing actionable without a branch name.
+        }
+        try {
+          commitCount = getBranchCommitCount(runInfo.baseCommit, effectiveCwd);
+        } catch {
+          // Treat an unreadable count as "no work"; return path stays safe.
+        }
+
+        if (commitCount > 0) {
+          try {
+            fetchBranchFromPath(
+              treehouseRepoRoot,
+              treehouseLease.path,
+              branchName,
+            );
+          } catch (error) {
+            appendDebugLog("treehouse:flowback-failed", {
+              error: serializeError(error),
+              branchName,
+              clonePath: treehouseLease.path,
+            });
+            console.error(
+              `\n  gnhf: could not land "${branchName}" in the main repo ` +
+                `(${error instanceof Error ? error.message : String(error)}).` +
+                `\n  gnhf: holding the lease so your work is NOT lost — it is committed in the clone at:` +
+                `\n        ${treehouseLease.path}` +
+                `\n  gnhf: recover it, then release the slot with: ` +
+                `${treehouseScript} return ${treehouseLease.token}\n`,
+            );
+            return; // do NOT return the lease — returning resets the clone
+          }
+        }
+
+        treehouseReturned = true;
+        treehouseReturn(treehouseScript, treehouseRepoRoot, treehouseLease.token);
+        if (commitCount > 0) {
+          console.error(
+            `\n  gnhf: landed "${branchName}" in the main repo — review and merge it there. ` +
+              `Released treehouse slot ${treehouseLease.slot}.\n`,
+          );
+        } else {
+          appendDebugLog("treehouse:returned-empty", {
+            slot: treehouseLease.slot,
+          });
+        }
+      };
+
+      if (treehouseLease) {
+        process.on("exit", () => {
+          if (!treehouseFinalizeRan) {
+            finalizeTreehouse();
+          }
+        });
+      }
+
       let sleepPreventionCleanup: (() => Promise<void>) | null = null;
       if (config.preventSleep) {
         const persistedPrompt =
@@ -914,8 +1078,14 @@ program
         }
       }
 
-      const runMode: "new" | "resume" | "worktree" | "current-branch" =
-        options.worktree
+      const runMode:
+        | "new"
+        | "resume"
+        | "worktree"
+        | "current-branch"
+        | "treehouse" = options.treehouse
+        ? "treehouse"
+        : options.worktree
           ? "worktree"
           : options.currentBranch
             ? "current-branch"
@@ -948,6 +1118,10 @@ program
           : undefined,
         worktree: options.worktree,
         worktreePath,
+        treehouse: options.treehouse,
+        treehouseSlot: treehouseLease?.slot,
+        treehousePort: treehouseLease?.port,
+        treehouseClonePath: treehouseLease?.path,
         currentBranch: options.currentBranch,
         push: options.push,
         platform: process.platform,
@@ -1167,6 +1341,10 @@ program
               worktreePath,
             });
           }
+        }
+
+        if (treehouseLease) {
+          finalizeTreehouse();
         }
 
         process.stdout.write(exitSummary);

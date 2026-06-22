@@ -20,6 +20,7 @@ import {
   createWorktree,
   removeWorktree,
   worktreeExists,
+  fetchBranchFromPath,
 } from "./git.js";
 
 const mockExecFileSync = vi.mocked(execFileSync);
@@ -461,6 +462,18 @@ describe("git utilities", () => {
         "--force",
         "/tmp/wt",
       ]);
+    });
+  });
+
+  describe("fetchBranchFromPath", () => {
+    it("force-fetches the branch into a local ref in the destination repo", () => {
+      fetchBranchFromPath("/main", "/clone", "gnhf/my-run");
+      expect(argsOfCall(0)).toEqual([
+        "fetch",
+        "/clone",
+        "+gnhf/my-run:refs/heads/gnhf/my-run",
+      ]);
+      expect(optionsOfCall(0).cwd).toBe("/main");
     });
   });
 
