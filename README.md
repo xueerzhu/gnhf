@@ -209,6 +209,7 @@ Lifecycle of a `--treehouse` run:
 
 - `--treehouse` must be run from a non-gnhf branch, and cannot be combined with `--worktree` or `--current-branch`.
 - Resume of an interrupted treehouse run is not automatic: the clone is reset on return, so re-run from the landed `gnhf/<slug>` branch in the main repo (it behaves like any other gnhf branch).
+- **Editor working-tree churn is the pool script's responsibility.** gnhf commits with `git add -A`, so if the leased editor rewrites or deletes tracked files on open (e.g. Unity regenerating asset metadata), that churn lands in the agent's commit. The pool-control script should keep its own volatile paths out of the way — the Tower Lab reference marks them `git update-index --skip-worktree` for the lease — so each commit reflects only the agent's work.
 
 ## CLI Reference
 
